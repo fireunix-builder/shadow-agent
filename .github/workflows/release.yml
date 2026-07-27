@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Private source branch, tag, or commit"
+        required: true
+        default: "main"
+        type: string
+      version:
+        description: "Release version, for example v0.1.0"
+        required: true
+        type: string
+      publish:
+        description: "Publish a GitHub Release"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Linux binaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out public builder
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: builder
+
+      - name: Check out private source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: fireunix-app/shadow-agent
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_REPO_PAT }}
+          persist-credentials: false
+          path: source
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: source/go.mod
+          cache: false
+
+      - name: Validate release version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid release version: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+      - name: Install eBPF build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev
+
+      - name: Generate, test, and package
+        shell: bash
+        env:
+          VERSION_TAG: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${VERSION_TAG#v}"
+          mkdir -p dist
+
+          cd source
+          go generate ./pkg/xdp
+          go test ./...
+
+          for arch in amd64 arm64; do
+            archive="shadow-agent-${version}-linux-${arch}"
+            package_dir="../dist/${archive}"
+            mkdir -p "${package_dir}/config"
+
+            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build \
+              -trimpath \
+              -ldflags="-s -w -X shadowbridge/data-plane/pkg/nodeinfo.Version=${version}" \
+              -o "../dist/bridge-linux-${arch}" .
+
+            install -m 0755 "../dist/bridge-linux-${arch}" "${package_dir}/bridge"
+            install -m 0644 deploy/shadowbridge-dataplane.service "${package_dir}/shadow-agent.service"
+            install -m 0644 config/example.toml "${package_dir}/config/example.toml"
+            install -m 0644 ../builder/README.md "${package_dir}/README.md"
+            tar -C ../dist -czf "../dist/${archive}.tar.gz" "${archive}"
+            rm -rf "${package_dir}" "../dist/bridge-linux-${arch}"
+          done
+
+          cd ..
+          sha256sum dist/*.tar.gz > dist/SHA256SUMS
+          rm -rf source
+
+      - name: Store release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: shadow-agent-release
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish GitHub Release
+        if: inputs.publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          assets=(dist/*.tar.gz dist/SHA256SUMS)
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber
+            exit 0
+          fi
+
+          gh release create "${RELEASE_TAG}" \
+            "${assets[@]}" \
+            --target "${GITHUB_SHA}" \
+            --title "Shadow Agent ${RELEASE_TAG}" \
+            --notes "Binaries built from the configured private source ref."
