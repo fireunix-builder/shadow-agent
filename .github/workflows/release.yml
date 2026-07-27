@@ -75,34 +75,46 @@ jobs:
           VERSION_TAG: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          version="${VERSION_TAG#v}"
-          mkdir -p dist
+          private_log="${RUNNER_TEMP}/private-build.log"
+          set +e
+          (
+            set -euo pipefail
+            version="${VERSION_TAG#v}"
+            mkdir -p dist
 
-          cd source
-          go generate ./pkg/xdp
-          go test ./...
+            cd source
+            go generate ./pkg/xdp
+            go test ./...
 
-          for arch in amd64 arm64; do
-            archive="shadow-agent-${version}-linux-${arch}"
-            package_dir="../dist/${archive}"
-            mkdir -p "${package_dir}/config"
+            for arch in amd64 arm64; do
+              archive="shadow-agent-${version}-linux-${arch}"
+              package_dir="../dist/${archive}"
+              mkdir -p "${package_dir}/config"
 
-            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build \
-              -trimpath \
-              -ldflags="-s -w -X shadowbridge/data-plane/pkg/nodeinfo.Version=${version}" \
-              -o "../dist/bridge-linux-${arch}" .
+              CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build \
+                -trimpath \
+                -ldflags="-s -w -X shadowbridge/data-plane/pkg/nodeinfo.Version=${version}" \
+                -o "../dist/bridge-linux-${arch}" .
 
-            install -m 0755 "../dist/bridge-linux-${arch}" "${package_dir}/bridge"
-            install -m 0644 deploy/shadowbridge-dataplane.service "${package_dir}/shadow-agent.service"
-            install -m 0644 config/example.toml "${package_dir}/config/example.toml"
-            install -m 0644 ../builder/README.md "${package_dir}/README.md"
-            tar -C ../dist -czf "../dist/${archive}.tar.gz" "${archive}"
-            rm -rf "${package_dir}" "../dist/bridge-linux-${arch}"
-          done
+              install -m 0755 "../dist/bridge-linux-${arch}" "${package_dir}/bridge"
+              install -m 0644 deploy/shadowbridge-dataplane.service "${package_dir}/shadow-agent.service"
+              install -m 0644 config/example.toml "${package_dir}/config/example.toml"
+              install -m 0644 ../builder/README.md "${package_dir}/README.md"
+              tar -C ../dist -czf "../dist/${archive}.tar.gz" "${archive}"
+              rm -rf "${package_dir}" "../dist/bridge-linux-${arch}"
+            done
 
-          cd ..
-          sha256sum dist/*.tar.gz > dist/SHA256SUMS
-          rm -rf source
+            cd ..
+            sha256sum dist/*.tar.gz > dist/SHA256SUMS
+            rm -rf source
+          ) >"${private_log}" 2>&1
+          status=$?
+          set -e
+          rm -f "${private_log}"
+          if (( status != 0 )); then
+            echo "::error::Private source build failed; detailed output was intentionally withheld."
+            exit "${status}"
+          fi
 
       - name: Store release artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
