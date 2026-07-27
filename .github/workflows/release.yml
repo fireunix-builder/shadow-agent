@@ -114,6 +114,82 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Install release tools
+        if: inputs.publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null
+          command -v gh >/dev/null
+          if ! command -v aws >/dev/null 2>&1; then
+            curl -fsSLo /tmp/awscliv2.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp
+            sudo /tmp/aws/install
+          fi
+
+      - name: Upload release artifacts to Cloudflare R2
+        if: inputs.publish
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+          RELEASE_TAG: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          : "${AWS_ACCESS_KEY_ID:?R2_ACCESS_KEY_ID is not configured}"
+          : "${AWS_SECRET_ACCESS_KEY:?R2_SECRET_ACCESS_KEY is not configured}"
+          : "${R2_ACCOUNT_ID:?R2_ACCOUNT_ID is not configured}"
+          : "${R2_BUCKET:?R2_BUCKET is not configured}"
+          : "${R2_PUBLIC_URL:?R2_PUBLIC_URL is not configured}"
+
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          prefix="Agent/${RELEASE_TAG}"
+          public_url="${R2_PUBLIC_URL%/}"
+          version="${RELEASE_TAG#v}"
+          amd64_file="shadow-agent-${version}-linux-amd64.tar.gz"
+          arm64_file="shadow-agent-${version}-linux-arm64.tar.gz"
+          amd64_sha="$(awk -v file="${amd64_file}" '{ name=$2; sub(/^.*\//, "", name); if (name == file) { print $1; exit } }' dist/SHA256SUMS)"
+          arm64_sha="$(awk -v file="${arm64_file}" '{ name=$2; sub(/^.*\//, "", name); if (name == file) { print $1; exit } }' dist/SHA256SUMS)"
+          test -n "${amd64_sha}"
+          test -n "${arm64_sha}"
+
+          aws s3 sync dist "s3://${R2_BUCKET}/${prefix}/" \
+            --endpoint-url "${endpoint}" \
+            --exclude "*" \
+            --include "*.tar.gz" \
+            --include "SHA256SUMS" \
+            --cache-control "public,max-age=31536000,immutable" \
+            --only-show-errors
+
+          jq -n \
+            --arg version "${RELEASE_TAG}" \
+            --arg released_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --arg amd64_url "${public_url}/${prefix}/${amd64_file}" \
+            --arg amd64_sha "${amd64_sha}" \
+            --arg arm64_url "${public_url}/${prefix}/${arm64_file}" \
+            --arg arm64_sha "${arm64_sha}" \
+            --arg checksums_url "${public_url}/${prefix}/SHA256SUMS" \
+            '{
+              version: $version,
+              released_at: $released_at,
+              files: {
+                amd64: {url: $amd64_url, sha256: $amd64_sha},
+                arm64: {url: $arm64_url, sha256: $arm64_sha}
+              },
+              checksums_url: $checksums_url
+            }' > dist/latest.json
+
+          aws s3 cp dist/latest.json "s3://${R2_BUCKET}/Agent/latest.json" \
+            --endpoint-url "${endpoint}" \
+            --content-type "application/json" \
+            --cache-control "no-cache,max-age=0" \
+            --only-show-errors
+
       - name: Publish GitHub Release
         if: inputs.publish
         shell: bash
